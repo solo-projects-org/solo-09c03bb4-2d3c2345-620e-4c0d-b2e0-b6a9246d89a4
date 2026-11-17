@@ -14,6 +14,11 @@ By default the script spawns TWO uvicorn processes sharing one SQLite file
   * parallel duplicate publishes collapse to one idempotent product
   * injected compute failure leaves no half-written product (atomicity)
   * slow computation never blocks another forecast time's ingestion
+  * storage inspection: healthy baseline, hash/length damage detection,
+    same-transaction revocation of current qualification with history retained,
+    REVISION_DAMAGED publish gate, healthy higher-revision repair + re-publish,
+    and interleaved inspection vs ingestion/republish (unverified never reported
+    healthy; stale verdicts never revoke healthy new products)
   * Swagger UI / OpenAPI availability
 
 Only the Python standard library is required.
@@ -93,6 +98,7 @@ def spawn_servers() -> Tuple[list, str, str, str, str]:
     env.update(
         RAIN_DB_PATH=db_path,
         RAIN_TEST_PUBLISH_DELAY_S="0.6",
+        RAIN_TEST_INSPECT_DELAY_S="0.7",
         RAIN_TEST_FAIL_MARKER=fail_marker,
         PYTHONPATH=ROOT,
     )
@@ -134,15 +140,17 @@ def main() -> int:
     base_a = os.environ.get("RAIN_BASE_A")
     base_b = os.environ.get("RAIN_BASE_B")
     fail_marker = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
+    db_path = os.environ.get("RAIN_DB_PATH", "")
     spawned = False
     procs: list = []
     if not base_a or not base_b:
-        procs, base_a, base_b, fail_marker, _ = spawn_servers()
+        procs, base_a, base_b, fail_marker, tmp = spawn_servers()
+        db_path = os.path.join(tmp, "rain.db")
         spawned = True
         print(f"[setup] spawned dual instances {base_a} / {base_b}")
     hooks_enabled = bool(fail_marker)
     try:
-        run(base_a, base_b, fail_marker, hooks_enabled)
+        run(base_a, base_b, fail_marker, hooks_enabled, db_path)
     finally:
         if spawned:
             shutdown(procs)
@@ -165,7 +173,8 @@ def register(base: str, members: int = 3, rows: int = 2, cols: int = 2,
     return data
 
 
-def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None:
+def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool,
+        db_path: str = "") -> None:
     print("\n[1] validation on registration")
     bad = {"forecast_time": "2026-11-16T00:00:00Z", "rows": 2, "cols": 2,
            "member_names": ["only-one"], "thresholds": [5.0]}
@@ -434,11 +443,310 @@ def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None
     check("openapi.json served", s == 200 and "paths" in openapi)
     for path in ("/groups", "/groups/{group_id}/members/{member_id}",
                  "/groups/{group_id}/publish",
+                 "/groups/{group_id}/inspect",
                  "/groups/{group_id}/products/current"):
         check(f"path {path} documented", path in openapi["paths"])
     req = urllib.request.Request(base_a + "/docs")
     with urllib.request.urlopen(req, timeout=10) as resp:
         check("Swagger UI served", resp.status == 200 and b"swagger" in resp.read().lower())
+
+    # ------------------------------------------------------------------ #
+    # Storage inspection (post volume-migration patrol)
+    # ------------------------------------------------------------------ #
+    import sqlite3
+
+    def db_corrupt_flip(gid: str, member_idx: int, revision: int) -> None:
+        """Same-length byte flip inside rain_blob -> content_hash mismatch."""
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT rain_blob FROM member_revisions"
+                " WHERE group_id=? AND member_idx=? AND revision=?",
+                (gid, member_idx, revision),
+            ).fetchone()
+            assert row is not None, "revision row missing for corruption"
+            blob = bytearray(row[0])
+            blob[0] ^= 0x5A
+            conn.execute(
+                "UPDATE member_revisions SET rain_blob=?"
+                " WHERE group_id=? AND member_idx=? AND revision=?",
+                (bytes(blob), gid, member_idx, revision),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def db_corrupt_truncate(gid: str, member_idx: int, revision: int,
+                            column: str = "miss_blob") -> None:
+        """Truncate a grid blob -> byte-length check failure."""
+        assert column in ("rain_blob", "miss_blob")
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                f"SELECT {column} FROM member_revisions"
+                " WHERE group_id=? AND member_idx=? AND revision=?",
+                (gid, member_idx, revision),
+            ).fetchone()
+            assert row is not None and len(row[0]) > 1
+            conn.execute(
+                f"UPDATE member_revisions SET {column}=?"
+                " WHERE group_id=? AND member_idx=? AND revision=?",
+                (row[0][:-1], gid, member_idx, revision),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    print("\n[13] inspection on healthy warehouses reports everything intact")
+    g9 = register(base_a, members=2, rows=4, cols=4, thresholds=[5.0])
+    gid9 = g9["group_id"]
+    http("PUT", base_a, f"/groups/{gid9}/members/m1",
+         {"rain": [[6.0] * 4 for _ in range(4)], "revision": 1})
+    http("PUT", base_b, f"/groups/{gid9}/members/m2",
+         {"rain": [[0.0] * 4 for _ in range(4)], "revision": 1})
+    s, insp = http("POST", base_a, f"/groups/{gid9}/inspect")
+    check("inspect 200 on healthy group", s == 200, str(insp))
+    check("healthy summary",
+          insp["summary"]["members_damaged"] == 0
+          and insp["summary"]["members_healthy"] == 2
+          and insp["summary"]["all_latest_healthy"] is True
+          and insp["summary"]["products_revoked"] == 0, str(insp["summary"]))
+    check("every check ok",
+          all(c["status"] == "ok" for m in insp["members"] for c in m["checks"]))
+    check("length + hash checks present per member",
+          all({c["check"] for c in m["checks"]}
+              == {"rain_length", "miss_length", "content_hash"}
+              for m in insp["members"]))
+    s, _ = http("POST", base_a, "/groups/does-not-exist/inspect")
+    check("inspect unknown group -> 404", s == 404)
+
+    print("\n[14] damage detection revokes current qualification and blocks publishing")
+    g10 = register(base_b, members=3, rows=3, cols=3, thresholds=[5.0, 10.0])
+    gid10 = g10["group_id"]
+    for i, name in enumerate(("m1", "m2", "m3")):
+        http("PUT", base_a, f"/groups/{gid10}/members/{name}",
+             {"rain": [[float(i + 1)] * 3 for _ in range(3)], "revision": 1})
+    s, p10 = http("POST", base_a, f"/groups/{gid10}/publish")
+    check("g10 baseline publish", s == 200 and p10["is_current"] is True)
+    pid10 = p10["product_id"]
+
+    if db_path:
+        db_corrupt_flip(gid10, member_idx=0, revision=1)       # m1: hash mismatch
+        db_corrupt_truncate(gid10, member_idx=2, revision=1)  # m3: length mismatch
+        s, insp = http("POST", base_b, f"/groups/{gid10}/inspect")
+        check("inspect 200 after corruption", s == 200)
+        sm = insp["summary"]
+        check("two damaged members reported",
+              sm["members_damaged"] == 2 and sm["members_healthy"] == 1
+              and sm["all_latest_healthy"] is False, str(sm))
+        by_member = {m["member_id"]: m for m in insp["members"]}
+        check("m1 damaged via content_hash",
+              by_member["m1"]["status"] == "damaged"
+              and any("content_hash mismatch" in r for r in by_member["m1"]["reasons"])
+              and by_member["m1"]["latest_verified"] is True)
+        check("m3 damaged via length",
+              by_member["m3"]["status"] == "damaged"
+              and any("length" in r for r in by_member["m3"]["reasons"]))
+        check("m2 stays healthy", by_member["m2"]["status"] == "healthy")
+        check("damaged_members payload lists m1 and m3 with revisions",
+              {d["member_id"]: d["revision"] for d in insp["damaged_members"]}
+              == {"m1": 1, "m3": 1})
+        check("one current product revoked in the same inspection",
+              len(insp["revoked_products"]) == 1
+              and insp["revoked_products"][0]["product_id"] == pid10
+              and {h["member_idx"] for h in insp["revoked_products"][0]["damaged_references"]}
+              == {0, 2}, str(insp["revoked_products"]))
+        s, d = http("GET", base_a, f"/groups/{gid10}/products/current")
+        check("damaged revision no longer serves a current warning product",
+              s == 404 and d["error"]["code"] == "NO_CURRENT_PRODUCT")
+        s, listing = http("GET", base_b, f"/groups/{gid10}/products")
+        check("revoked product retained as history",
+              [(p["product_id"], p["is_current"]) for p in listing["products"]]
+              == [(pid10, False)])
+        s, hist = http("GET", base_a, f"/groups/{gid10}/products/{pid10}")
+        check("historical product still fetchable", s == 200 and hist["is_current"] is False)
+        s, d = http("POST", base_a, f"/groups/{gid10}/publish")
+        check("publish refuses damaged revisions",
+              s == 409 and d["error"]["code"] == "REVISION_DAMAGED", str(d))
+        # re-inspection is deterministic and does not create extra product rows
+        s, insp2 = http("POST", base_b, f"/groups/{gid10}/inspect")
+        check("re-inspect still reports the same two damaged members",
+          insp2["summary"]["members_damaged"] == 2
+          and insp2["summary"]["products_revoked"] == 0)
+        s, listing = http("GET", base_a, f"/groups/{gid10}/products")
+        check("no new product rows created by inspection",
+              len(listing["products"]) == 1)
+    else:
+        print("  SKIP  direct-db corruption tests (RAIN_DB_PATH unavailable)")
+
+    print("\n[15] healthy higher revisions allow re-publish after damage")
+    if db_path:
+        # repair by submitting strictly higher, healthy revisions
+        for name in ("m1", "m2", "m3"):
+            s, _ = http("PUT", base_b, f"/groups/{gid10}/members/{name}",
+                        {"rain": [[8.0] * 3 for _ in range(3)], "revision": 2})
+            check(f"{name} rev2 accepted after damage", s == 200)
+        s, insp = http("POST", base_a, f"/groups/{gid10}/inspect")
+        check("post-repair inspection all healthy",
+              s == 200 and insp["summary"]["members_damaged"] == 0
+              and insp["summary"]["all_latest_healthy"] is True
+              and insp["summary"]["products_revoked"] == 0, str(insp["summary"]))
+        check("inspection verifies revision 2",
+              all(m["inspected_revision"] == 2 and m["latest_revision"] == 2
+                  for m in insp["members"]))
+        s, p11 = http("POST", base_b, f"/groups/{gid10}/publish")
+        check("re-publish after repair succeeds",
+              s == 200 and p11["is_current"] is True and p11["product_id"] != pid10)
+        check("new product uses rev2 only",
+              {m["member_id"]: m["revision"] for m in p11["members_used"]}
+              == {"m1": 2, "m2": 2, "m3": 2})
+        s, cur = http("GET", base_a, f"/groups/{gid10}/products/current")
+        check("current product restored", s == 200 and cur["product_id"] == p11["product_id"])
+        s, listing = http("GET", base_b, f"/groups/{gid10}/products")
+        check("full history retained (revoked old + new current)",
+              sorted((p["product_id"], p["is_current"]) for p in listing["products"])
+              == sorted([(pid10, False), (p11["product_id"], True)]))
+    else:
+        print("  SKIP  repair flow (RAIN_DB_PATH unavailable)")
+
+    print("\n[16] interleaved inspection vs ingestion/republish across two instances")
+    # 16a: new healthy revision landing during hashing is never reported healthy
+    g11 = register(base_a, members=2, rows=8, cols=8, thresholds=[5.0])
+    gid11 = g11["group_id"]
+    http("PUT", base_a, f"/groups/{gid11}/members/m1",
+         {"rain": [[1.0] * 8 for _ in range(8)], "revision": 1})
+    http("PUT", base_b, f"/groups/{gid11}/members/m2",
+         {"rain": [[2.0] * 8 for _ in range(8)], "revision": 1})
+    http("POST", base_a, f"/groups/{gid11}/publish")
+    result16: Dict[str, Any] = {}
+
+    def slow_inspect() -> None:
+        result16["inspect"] = http("POST", base_a, f"/groups/{gid11}/inspect")
+
+    th = threading.Thread(target=slow_inspect)
+    th.start()
+    time.sleep(0.2)  # enter the slow hashing window (RAIN_TEST_INSPECT_DELAY_S)
+    t0 = time.time()
+    s, _ = http("PUT", base_b, f"/groups/{gid11}/members/m1",
+                {"rain": [[9.0] * 8 for _ in range(8)], "revision": 2})
+    ingest_elapsed = time.time() - t0
+    check("ingestion not blocked by in-flight inspection hashing", s == 200)
+    if hooks_enabled:
+        check("ingestion stayed fast during inspection", ingest_elapsed < 0.5,
+              f"{ingest_elapsed:.2f}s")
+    th.join()
+    s, insp = result16["inspect"]
+    check("interleaved inspection still 200", s == 200, str(insp))
+    by_member = {m["member_id"]: m for m in insp["members"]}
+    check("new rev2 reported unverified, never falsely healthy",
+          by_member["m1"]["status"] == "unverified"
+          and by_member["m1"]["latest_verified"] is False
+          and by_member["m1"]["inspected_revision"] == 1
+          and by_member["m1"]["latest_revision"] == 2, str(by_member["m1"]))
+    check("superseded rev1 verdict carried for traceability",
+          by_member["m1"]["superseded_inspection"]["revision"] == 1
+          and by_member["m1"]["superseded_inspection"]["healthy"] is True)
+    check("unaffected member still verified healthy",
+          by_member["m2"]["status"] == "healthy")
+    check("no product revoked by a stale verdict against a healthy new revision",
+          insp["summary"]["products_revoked"] == 0)
+    s, cur = http("GET", base_b, f"/groups/{gid11}/products/current")
+    check("existing current product untouched by the interleaved inspection",
+          s == 404)  # rev2 submission already expired the rev1 product
+    # a follow-up inspection verifies the new revision properly
+    s, insp = http("POST", base_b, f"/groups/{gid11}/inspect")
+    check("follow-up inspection verifies rev2 as healthy",
+          insp["summary"]["all_latest_healthy"] is True
+          and {m["member_id"]: m["status"] for m in insp["members"]}
+          == {"m1": "healthy", "m2": "healthy"})
+    s, p12 = http("POST", base_a, f"/groups/{gid11}/publish")
+    check("republish healthy new revision set", s == 200 and p12["is_current"] is True)
+
+    # 16b: damaged product revoked while another time ingests concurrently
+    if db_path:
+        g12 = register(base_b, members=2, rows=4, cols=4, thresholds=[5.0])
+        gid12 = g12["group_id"]
+        http("PUT", base_a, f"/groups/{gid12}/members/m1",
+             {"rain": [[6.0] * 4 for _ in range(4)], "revision": 1})
+        http("PUT", base_a, f"/groups/{gid12}/members/m2",
+             {"rain": [[6.0] * 4 for _ in range(4)], "revision": 1})
+        s, p13 = http("POST", base_a, f"/groups/{gid12}/publish")
+        check("g12 baseline publish", s == 200 and p13["is_current"] is True)
+        db_corrupt_flip(gid12, member_idx=1, revision=1)
+
+        other = register(base_a, members=2, rows=2, cols=2, thresholds=[5.0])
+        goid = other["group_id"]
+        result16b: Dict[str, Any] = {}
+
+        def inspect_damaged() -> None:
+            result16b["inspect"] = http("POST", base_b, f"/groups/{gid12}/inspect")
+
+        th = threading.Thread(target=inspect_damaged)
+        th.start()
+        time.sleep(0.2)
+        t0 = time.time()
+        s1, _ = http("PUT", base_a, f"/groups/{goid}/members/m1",
+                     {"rain": [[1.0, 2.0], [3.0, 4.0]], "revision": 1})
+        s2, _ = http("PUT", base_b, f"/groups/{goid}/members/m2",
+                     {"rain": [[4.0, 3.0], [2.0, 1.0]], "revision": 1})
+        other_elapsed = time.time() - t0
+        check("other time ingested during damage inspection", s1 == 200 and s2 == 200)
+        if hooks_enabled:
+            check("other-time ingest stayed fast", other_elapsed < 0.5,
+                  f"{other_elapsed:.2f}s")
+        th.join()
+        s, insp = result16b["inspect"]
+        check("damaged member confirmed and product revoked",
+              s == 200 and insp["summary"]["members_damaged"] == 1
+              and insp["summary"]["products_revoked"] == 1
+              and insp["revoked_products"][0]["product_id"] == p13["product_id"])
+        s, d = http("GET", base_a, f"/groups/{gid12}/products/current")
+        check("revoked product not current", s == 404)
+        s, po = http("POST", base_b, f"/groups/{goid}/publish")
+        check("other time publishes fine after concurrent inspection",
+              s == 200 and po["is_current"] is True)
+
+        # 16c: repair + republish landing during hashing must keep the healthy
+        # new product current; the stale damage verdict is never applied to it
+        g13 = register(base_a, members=2, rows=5, cols=5, thresholds=[5.0])
+        gid13 = g13["group_id"]
+        http("PUT", base_a, f"/groups/{gid13}/members/m1",
+             {"rain": [[6.0] * 5 for _ in range(5)], "revision": 1})
+        http("PUT", base_b, f"/groups/{gid13}/members/m2",
+             {"rain": [[0.0] * 5 for _ in range(5)], "revision": 1})
+        s, p14 = http("POST", base_a, f"/groups/{gid13}/publish")
+        check("g13 baseline publish", s == 200 and p14["is_current"] is True)
+        db_corrupt_flip(gid13, member_idx=0, revision=1)
+        result16c: Dict[str, Any] = {}
+
+        def inspect_then_repair() -> None:
+            result16c["inspect"] = http("POST", base_b, f"/groups/{gid13}/inspect")
+
+        th = threading.Thread(target=inspect_then_repair)
+        th.start()
+        time.sleep(0.2)  # inspection is hashing the damaged rev1 snapshot
+        s, _ = http("PUT", base_a, f"/groups/{gid13}/members/m1",
+                    {"rain": [[7.0] * 5 for _ in range(5)], "revision": 2})
+        check("repair revision lands during inspection", s == 200)
+        s, p15 = http("POST", base_b, f"/groups/{gid13}/publish")
+        check("healthy new product published during inspection",
+              s == 200 and p15["is_current"] is True and p15["product_id"] != p14["product_id"])
+        th.join()
+        s, insp = result16c["inspect"]
+        check("interleaved inspection 200", s == 200, str(insp))
+        check("stale damage verdict did not revoke the healthy new product",
+              insp["summary"]["products_revoked"] == 0
+              and {m["member_id"]: m["status"] for m in insp["members"]}["m1"]
+              == "unverified", str(insp["summary"]))
+        s, cur = http("GET", base_a, f"/groups/{gid13}/products/current")
+        check("healthy new product remains the current warning basis",
+              s == 200 and cur["product_id"] == p15["product_id"] and cur["is_current"] is True)
+        s, listing = http("GET", base_b, f"/groups/{gid13}/products")
+        check("old product history retained, new one current",
+              sorted((p["product_id"], p["is_current"]) for p in listing["products"])
+              == sorted([(p14["product_id"], False), (p15["product_id"], True)]))
+    else:
+        print("  SKIP  concurrent damage inspection (RAIN_DB_PATH unavailable)")
 
 
 if __name__ == "__main__":

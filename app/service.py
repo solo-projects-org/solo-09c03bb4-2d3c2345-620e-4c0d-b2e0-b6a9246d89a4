@@ -33,11 +33,13 @@ from .storage import (
     encode_blob,
     matrix_to_json,
     to_arrays,
+    verify_revision_blobs,
 )
 
 # --- test hooks (disabled unless explicitly enabled; never on by default) ---
 PUBLISH_DELAY_S = float(os.environ.get("RAIN_TEST_PUBLISH_DELAY_S", "0"))
 FAIL_MARKER = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
+INSPECT_DELAY_S = float(os.environ.get("RAIN_TEST_INSPECT_DELAY_S", "0"))
 
 
 def _is_busy(exc: Exception) -> bool:
@@ -218,32 +220,67 @@ def publish_product(group_id: str) -> Dict[str, Any]:
                 conn.execute("BEGIN")
                 group, members, revision_map = _read_snapshot(conn, group_id)
                 revs = conn.execute(
-                    "SELECT group_id, member_idx, revision, rain_blob, miss_blob"
+                    "SELECT group_id, member_idx, revision, content_hash,"
+                    " rain_blob, miss_blob"
                     " FROM member_revisions WHERE group_id = ?",
                     (group_id,),
                 ).fetchall()
-                existing = conn.execute(
-                    "SELECT product_id FROM products"
-                    " WHERE group_id = ? AND revision_map = ? AND is_current = 1",
-                    (group_id, _canonical_revision_map(revision_map)),
-                ).fetchone()
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
-        if existing is not None:
-            return _load_product(existing["product_id"])
-
+        n_cells = group["rows"] * group["cols"]
         wanted = {
             (int(r["member_idx"]), int(r["revision"])): (
-                decode_float(r["rain_blob"], group["rows"] * group["cols"]),
-                decode_mask(r["miss_blob"], group["rows"] * group["cols"]),
+                r["content_hash"],
+                r["rain_blob"],
+                r["miss_blob"],
             )
             for r in revs
         }
-        rains = [wanted[(idx, revision_map[idx])][0] for idx in sorted(revision_map)]
-        misses = [wanted[(idx, revision_map[idx])][1] for idx in sorted(revision_map)]
+
+        # 1b) publish gate: a damaged (e.g. migrated-volume corrupted) revision
+        # can never back a warning product. Verification is CPU work done while
+        # no write lock is held.
+        damaged_publish: List[str] = []
+        snapshot_hashes: Dict[Tuple[int, int], str] = {}
+        for idx in sorted(revision_map):
+            key = (idx, revision_map[idx])
+            stored_hash, rain_blob, miss_blob = wanted[key]
+            snapshot_hashes[key] = stored_hash
+            verdict = verify_revision_blobs(
+                rain_blob, miss_blob, n_cells, stored_hash
+            )
+            if not verdict["healthy"]:
+                damaged_publish.append(
+                    f"member_idx={idx} revision={revision_map[idx]}"
+                )
+        if damaged_publish:
+            raise ApiError(
+                409,
+                "REVISION_DAMAGED",
+                "refusing to publish: stored grid bytes fail the warehouse"
+                " summary check for " + "; ".join(damaged_publish),
+            )
+
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT product_id FROM products"
+                " WHERE group_id = ? AND revision_map = ? AND is_current = 1",
+                (group_id, _canonical_revision_map(revision_map)),
+            ).fetchone()
+        if existing is not None:
+            return _load_product(existing["product_id"])
+
+        rains = [
+            decode_float(wanted[(idx, revision_map[idx])][1], n_cells)
+            for idx in sorted(revision_map)
+        ]
+        misses = [
+            decode_mask(wanted[(idx, revision_map[idx])][2], n_cells)
+            for idx in sorted(revision_map)
+        ]
 
         # 2) slow compute happens OUTSIDE the write lock: other groups keep ingesting
         if PUBLISH_DELAY_S > 0:
@@ -269,16 +306,19 @@ def publish_product(group_id: str) -> Dict[str, Any]:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     latest_map: Dict[int, int] = {}
+                    latest_hashes: Dict[int, str] = {}
                     for m in members:
                         rev = conn.execute(
-                            "SELECT revision FROM member_revisions"
+                            "SELECT revision, content_hash FROM member_revisions"
                             " WHERE group_id = ? AND member_idx = ? ORDER BY revision DESC LIMIT 1",
                             (group_id, m["member_idx"]),
                         ).fetchone()
                         if rev is None:
                             conn.execute("ROLLBACK")
                             raise ApiError(409, "MEMBERS_INCOMPLETE", "member disappeared before publish commit")
-                        latest_map[int(m["member_idx"])] = int(rev["revision"])
+                        idx = int(m["member_idx"])
+                        latest_map[idx] = int(rev["revision"])
+                        latest_hashes[idx] = rev["content_hash"]
 
                     if latest_map != revision_map:
                         # a correction landed while we were computing: this product
@@ -289,6 +329,22 @@ def publish_product(group_id: str) -> Dict[str, Any]:
                                 409,
                                 "REVISION_CHANGED",
                                 "member revisions changed during publish; retry the request",
+                            )
+                        should_retry_snapshot = True
+                        break
+
+                    if any(
+                        latest_hashes[idx] != snapshot_hashes[(idx, revision_map[idx])]
+                        for idx in revision_map
+                    ):
+                        # the bytes/summary of a revision we verified changed on
+                        # disk before commit: re-snapshot so the gate re-verifies
+                        conn.execute("ROLLBACK")
+                        if attempt >= 3:
+                            raise ApiError(
+                                409,
+                                "REVISION_DAMAGED",
+                                "stored grid bytes changed during publish; retry the request",
                             )
                         should_retry_snapshot = True
                         break
@@ -352,6 +408,273 @@ def publish_product(group_id: str) -> Dict[str, Any]:
             continue
 
     raise ApiError(409, "REVISION_CHANGED", "member revisions kept changing during publish; retry the request")
+
+
+# --------------------------------------------------------------------------- #
+# Storage inspection (post volume-migration integrity patrol)
+# --------------------------------------------------------------------------- #
+def inspect_group(group_id: str) -> Dict[str, Any]:
+    """Patrol the *latest* revision of every member of one forecast time.
+
+    Flow (mirrors the publish concurrency design):
+
+    1. short read transaction: snapshot each member's latest revision and its
+       stored blobs/summary, then release all locks;
+    2. outside any transaction: verify grid byte lengths and recompute the
+       SHA-256 over the actual bytes (slow on big grids, but never holding the
+       write lock, so other times keep ingesting);
+    3. short ``BEGIN IMMEDIATE`` write transaction: re-read the latest revisions
+       and only apply verdicts that are still current. A member whose revision
+       moved on during hashing is reported ``unverified``; a stale damage
+       verdict can never revoke a healthy newer product. Current products whose
+       revision set contains a confirmed damaged revision lose their current
+       qualification in the same transaction (history rows are retained).
+    """
+    for attempt in range(1, 4):
+        # ---- 1) snapshot (short read tx, no write lock) ----
+        with get_conn() as conn:
+            try:
+                conn.execute("BEGIN")
+                group = _get_group(conn, group_id)
+                member_rows = conn.execute(
+                    "SELECT member_idx, member_id FROM members"
+                    " WHERE group_id = ? ORDER BY member_idx",
+                    (group_id,),
+                ).fetchall()
+                n_cells = group["rows"] * group["cols"]
+                snapshot: Dict[int, Dict[str, Any]] = {}
+                for m in member_rows:
+                    rev = conn.execute(
+                        "SELECT revision, content_hash, rain_blob, miss_blob"
+                        " FROM member_revisions"
+                        " WHERE group_id = ? AND member_idx = ?"
+                        " ORDER BY revision DESC LIMIT 1",
+                        (group_id, m["member_idx"]),
+                    ).fetchone()
+                    if rev is not None:
+                        snapshot[int(m["member_idx"])] = {
+                            "member_id": m["member_id"],
+                            "revision": int(rev["revision"]),
+                            "content_hash": rev["content_hash"],
+                            "rain_blob": rev["rain_blob"],
+                            "miss_blob": rev["miss_blob"],
+                        }
+                    else:
+                        snapshot[int(m["member_idx"])] = {"member_id": m["member_id"], "revision": None}
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        # ---- 2) heavy verification OUTSIDE every transaction/lock ----
+        if INSPECT_DELAY_S > 0:
+            time.sleep(INSPECT_DELAY_S)  # test hook: widen the interleaving window
+        verdicts: Dict[int, Dict[str, Any]] = {}
+        for idx, item in snapshot.items():
+            if item["revision"] is None:
+                continue
+            verdicts[idx] = verify_revision_blobs(
+                item["rain_blob"], item["miss_blob"], n_cells, item["content_hash"]
+            )
+
+        # ---- 3) re-confirm under the write lock and revoke atomically ----
+        write_attempts = 0
+        retry_snapshot = False
+        with get_conn() as conn:
+            while True:
+                write_attempts += 1
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    current_state: Dict[int, Dict[str, Any]] = {}
+                    for m in member_rows:
+                        rev = conn.execute(
+                            "SELECT revision, content_hash FROM member_revisions"
+                            " WHERE group_id = ? AND member_idx = ?"
+                            " ORDER BY revision DESC LIMIT 1",
+                            (group_id, m["member_idx"]),
+                        ).fetchone()
+                        idx = int(m["member_idx"])
+                        if rev is None:
+                            current_state[idx] = {"revision": None, "content_hash": None}
+                        else:
+                            current_state[idx] = {
+                                "revision": int(rev["revision"]),
+                                "content_hash": rev["content_hash"],
+                            }
+
+                    damaged_pairs: List[Tuple[int, int]] = []
+                    member_reports: List[Dict[str, Any]] = []
+                    n_damaged = n_unverified = 0
+                    for m in member_rows:
+                        idx = int(m["member_idx"])
+                        member_id = m["member_id"]
+                        snap = snapshot[idx]
+                        cur = current_state[idx]
+                        base = {
+                            "member_idx": idx,
+                            "member_id": member_id,
+                            "inspected_revision": snap["revision"],
+                            "latest_revision": cur["revision"],
+                        }
+                        if snap["revision"] is None:
+                            # nothing ingested when the patrol started
+                            if cur["revision"] is None:
+                                base["status"] = "no_revision"
+                            else:
+                                # landed while we were hashing: never claim health
+                                base["status"] = "unverified"
+                                base["latest_verified"] = False
+                                n_unverified += 1
+                            member_reports.append(base)
+                            continue
+
+                        same_revision = cur["revision"] == snap["revision"]
+                        same_hash = cur["content_hash"] == snap["content_hash"]
+                        if not same_revision:
+                            # a new revision landed while we were hashing: the
+                            # old verdict must not act on the new one, and the
+                            # new version itself is not verified in this patrol
+                            base["status"] = "unverified"
+                            base["latest_verified"] = False
+                            n_unverified += 1
+                            old_verdict = verdicts[idx]
+                            base["superseded_inspection"] = {
+                                "revision": snap["revision"],
+                                "healthy": old_verdict["healthy"],
+                                "checks": old_verdict["checks"],
+                                "reasons": old_verdict["reasons"],
+                            }
+                            member_reports.append(base)
+                            continue
+                        if not same_hash:
+                            # same revision number but bytes/summary changed
+                            # during hashing: discard the race-tainted verdict
+                            # and re-patrol from a fresh snapshot
+                            conn.execute("ROLLBACK")
+                            if attempt >= 3:
+                                raise ApiError(
+                                    409,
+                                    "REVISION_CHANGED",
+                                    "stored grid bytes changed during inspection; retry the request",
+                                )
+                            retry_snapshot = True
+                            break
+
+                        verdict = verdicts[idx]
+                        base["status"] = "healthy" if verdict["healthy"] else "damaged"
+                        base["latest_verified"] = True
+                        base["checks"] = verdict["checks"]
+                        base["reasons"] = verdict["reasons"]
+                        base["stored_hash"] = snap["content_hash"]
+                        if verdict["healthy"]:
+                            member_reports.append(base)
+                        else:
+                            n_damaged += 1
+                            damaged_pairs.append((idx, snap["revision"]))
+                            base["damage"] = {
+                                "revision": snap["revision"],
+                                "reasons": verdict["reasons"],
+                                "checks": verdict["checks"],
+                            }
+                            member_reports.append(base)
+                    if retry_snapshot:
+                        break
+
+                    # Revoke current qualification of every current product that
+                    # references a revision now confirmed damaged. Rows stay in
+                    # the table (history retained); only is_current flips to 0.
+                    revoked: List[Dict[str, Any]] = []
+                    if damaged_pairs:
+                        current_products = conn.execute(
+                            "SELECT product_id, revision_map FROM products"
+                            " WHERE group_id = ? AND is_current = 1",
+                            (group_id,),
+                        ).fetchall()
+                        for prow in current_products:
+                            rev_map = {
+                                int(k): int(v)
+                                for k, v in json.loads(prow["revision_map"]).items()
+                            }
+                            hits = [
+                                {"member_idx": idx, "revision": rev}
+                                for idx, rev in damaged_pairs
+                                if rev_map.get(idx) == rev
+                            ]
+                            if hits:
+                                conn.execute(
+                                    "UPDATE products SET is_current = 0 WHERE product_id = ?",
+                                    (prow["product_id"],),
+                                )
+                                revoked.append(
+                                    {
+                                        "product_id": int(prow["product_id"]),
+                                        "revision_map": rev_map,
+                                        "damaged_references": hits,
+                                    }
+                                )
+                    conn.execute("COMMIT")
+                    damaged_members = [
+                        {
+                            "member_idx": rep["member_idx"],
+                            "member_id": rep["member_id"],
+                            "revision": rep["damage"]["revision"],
+                            "reasons": rep["damage"]["reasons"],
+                            "checks": rep["damage"]["checks"],
+                        }
+                        for rep in member_reports
+                        if rep["status"] == "damaged"
+                    ]
+                    return {
+                        "group_id": group_id,
+                        "forecast_time": group["forecast_time"],
+                        "inspected_at": _now_iso(),
+                        "summary": {
+                            "members_total": len(member_rows),
+                            "members_healthy": sum(
+                                1 for r in member_reports if r["status"] == "healthy"
+                            ),
+                            "members_damaged": n_damaged,
+                            "members_unverified": n_unverified,
+                            "members_without_revision": sum(
+                                1 for r in member_reports if r["status"] == "no_revision"
+                            ),
+                            "products_revoked": len(revoked),
+                            "all_latest_healthy": n_damaged == 0
+                            and n_unverified == 0
+                            and all(
+                                r["status"] == "healthy" for r in member_reports
+                            ),
+                        },
+                        "members": member_reports,
+                        "damaged_members": damaged_members,
+                        "revoked_products": revoked,
+                    }
+                except ApiError:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                except Exception as exc:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    if _is_busy(exc) and write_attempts < 3:
+                        time.sleep(0.05 * write_attempts)
+                        continue
+                    if _is_busy(exc):
+                        raise ApiError(
+                            503, "DATABASE_BUSY",
+                            "database locked by another writer; retry the inspection",
+                        ) from exc
+                    raise
+        if retry_snapshot:
+            continue
+
+    raise ApiError(503, "DATABASE_BUSY", "inspection could not obtain a consistent snapshot; retry")
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 # --------------------------------------------------------------------------- #

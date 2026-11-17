@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
 from .errors import ApiError
+
+# On-disk element sizes; a healthy revision's blobs must be exactly these long.
+FLOAT64_BYTES = 8
+UINT8_BYTES = 1
+INT64_BYTES = 8
 
 
 def to_arrays(
@@ -83,6 +88,98 @@ def matrix_to_json(flat: np.ndarray, rows: int, cols: int) -> List[List[float | 
 
 def encode_blob(arr: np.ndarray) -> bytes:
     return np.ascontiguousarray(arr).tobytes()
+
+
+def expected_blob_bytes(n_cells: int) -> Tuple[int, int]:
+    """Expected (rain_blob, miss_blob) byte lengths for a grid of ``n_cells`` cells."""
+    return n_cells * FLOAT64_BYTES, n_cells * UINT8_BYTES
+
+
+def verify_revision_blobs(
+    rain_blob: bytes,
+    miss_blob: bytes,
+    n_cells: int,
+    stored_hash: str,
+) -> Dict[str, Any]:
+    """Check an ingested revision against its warehouse summary.
+
+    Two independent checks are reported, mirroring what a shared-volume
+    migration can damage:
+
+    * ``rain_length`` / ``miss_length``: the grid byte length still matches
+      ``rows * cols`` times the element width (truncation / padding detection);
+    * ``content_hash``: when both blobs have the correct length, recompute the
+      SHA-256 over the actual bytes and compare with the summary stored at
+      ingestion time (byte-flip detection). The hash check is skipped rather
+      than faked when a length check already failed, so an unverified revision
+      is never reported as healthy.
+
+    Runs entirely outside any write transaction: hashing a large grid never
+    blocks other forecast times from ingesting.
+    """
+    exp_rain, exp_miss = expected_blob_bytes(n_cells)
+    rain_len_ok = len(rain_blob) == exp_rain
+    miss_len_ok = len(miss_blob) == exp_miss
+
+    checks: List[Dict[str, Any]] = [
+        {
+            "check": "rain_length",
+            "status": "ok" if rain_len_ok else "damaged",
+            "actual_bytes": len(rain_blob),
+            "expected_bytes": exp_rain,
+        },
+        {
+            "check": "miss_length",
+            "status": "ok" if miss_len_ok else "damaged",
+            "actual_bytes": len(miss_blob),
+            "expected_bytes": exp_miss,
+        },
+    ]
+    reasons: List[str] = []
+    if not rain_len_ok:
+        reasons.append(
+            f"rain_blob length {len(rain_blob)} != expected {exp_rain}"
+        )
+    if not miss_len_ok:
+        reasons.append(
+            f"miss_blob length {len(miss_blob)} != expected {exp_miss}"
+        )
+
+    if rain_len_ok and miss_len_ok:
+        rain_arr = np.frombuffer(rain_blob, dtype=np.float64, count=n_cells)
+        miss_arr = np.frombuffer(miss_blob, dtype=np.uint8, count=n_cells)
+        recomputed = content_hash(rain_arr, miss_arr)
+        hash_ok = recomputed == stored_hash
+        checks.append(
+            {
+                "check": "content_hash",
+                "status": "ok" if hash_ok else "damaged",
+                "stored_hash": stored_hash,
+                "recomputed_hash": recomputed,
+            }
+        )
+        if not hash_ok:
+            reasons.append(
+                f"content_hash mismatch: stored {stored_hash} != recomputed {recomputed}"
+            )
+    else:
+        # Cannot recompute a fixed-shape hash over truncated/padded bytes;
+        # report the check as skipped instead of claiming a verdict.
+        checks.append(
+            {
+                "check": "content_hash",
+                "status": "skipped_due_to_length",
+                "stored_hash": stored_hash,
+                "recomputed_hash": None,
+            }
+        )
+
+    healthy = rain_len_ok and miss_len_ok and hash_ok if (rain_len_ok and miss_len_ok) else False
+    return {
+        "healthy": healthy,
+        "checks": checks,
+        "reasons": reasons,
+    }
 
 
 def decode_float(blob: bytes, n_cells: int) -> np.ndarray:

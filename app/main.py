@@ -91,6 +91,15 @@ def publish(group_id: str) -> dict:
     return service.publish_product(group_id)
 
 
+@app.post(
+    "/groups/{group_id}/inspect",
+    tags=["inspection"],
+    summary="入仓巡检：核对各成员最新修订的网格字节长度与入仓摘要，撤销受损现行资格",
+)
+def inspect(group_id: str) -> dict:
+    return service.inspect_group(group_id)
+
+
 @app.get(
     "/groups/{group_id}/products/current",
     tags=["products"],
